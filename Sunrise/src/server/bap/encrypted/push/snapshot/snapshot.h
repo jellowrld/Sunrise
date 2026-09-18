@@ -11,16 +11,16 @@
 
 namespace sunrise::server::bap::encrypted::push::snapshot {
 
-/** Account and selected-character identity take the first two family-four descriptors. */
+/** Account and selected-character identity occupy the first two Family-4 descriptors. */
 inline constexpr std::size_t kFamily4IdentityObjectCount = 2;
 /**
- * Family four carries both identity objects plus one item record per equipped item, for every
- * character. The equip-summary reader looks up an instance with no null check, so no character in
- * the roster may point at a record this snapshot leaves out.
+ * Identity objects plus every character instance and resident-backed profile stack.
+ * Every nonzero inventory SOID needs a published object.
  */
 inline constexpr std::size_t kObjectCapacity =
     kFamily4IdentityObjectCount
-    + state::kCharacterCapacity * middleware::datagen::family4::loadout::kItemCapacity;
+    + state::kCharacterCapacity * middleware::datagen::family4::loadout::kItemCapacity
+    + state::account::inventory::kProfileActionSourceCapacity;
 
 /** Prepared descriptors and scratch extents owned until the update codec copies their bodies. */
 struct Prepared {
@@ -44,9 +44,19 @@ struct Prepared {
  * @param prepared Gets the object descriptors and scratch clear extents.
  * @return True when the asked-for snapshot is valid for the current State and mappings.
  */
-[[nodiscard]] bool prepare_initial(Scratch& scratch,
-                                   const middleware::queuez::Subscription& subscription,
-                                   Prepared& prepared) noexcept;
+[[nodiscard]] bool
+prepare_initial(Scratch& scratch,
+                const middleware::queuez::Subscription& subscription,
+                std::span<const queuez::AcquisitionPresentationRow> acquisitionPresentationRows,
+                Prepared& prepared) noexcept;
+
+/** Rebuilds the active account family at the peer's next version. */
+[[nodiscard]] bool prepare_family4_refresh(
+    Scratch& scratch,
+    std::uint64_t familyRootSoid,
+    std::int32_t version,
+    std::span<const queuez::AcquisitionPresentationRow> acquisitionPresentationRows,
+    Prepared& prepared) noexcept;
 
 /**
  * Builds the family-zero banner anchor and the record for the character it names.
@@ -63,5 +73,38 @@ struct Prepared {
                                   std::int32_t version,
                                   std::uint64_t previousCharacter,
                                   Prepared& prepared) noexcept;
+
+/**
+ * Builds the one-record Family-0 incremental that refreshes rendered equipment in place.
+ * Encoded from the prepared after-image: the transaction commits only once both frames fit.
+ * @param scratch Raw object storage owned by the lock.
+ * @param refresh Family-0 root, version, and resident the incremental is built against.
+ * @param afterCharacter Prepared State after-image the record is encoded from.
+ * @param characterIndex Position of that character in the account.
+ * @param nativeEquipmentSlot Native slot whose rendered item changed.
+ * @param replaceCharacterRecord Recreate the resident record so a same-instance shader or
+ *        ornament change rebuilds the render binding.
+ * @param prepared Gets the descriptors and the scratch clear extent.
+ * @return True when the character resolves and every object fits raw storage.
+ */
+[[nodiscard]] bool
+prepare_character_appearance_refresh(Scratch& scratch,
+                                     const queuez::CharacterAppearanceRefresh& refresh,
+                                     const state::CharacterState& afterCharacter,
+                                     std::size_t characterIndex,
+                                     std::uint8_t nativeEquipmentSlot,
+                                     bool replaceCharacterRecord,
+                                     Prepared& prepared) noexcept;
+
+/**
+ * Builds one Family-3 appearance increment from an uncommitted character after-image.
+ * The
+ * character record is always first; when requested, the changed account roster follows it.
+ */
+[[nodiscard]] bool prepare_roster_appearance_refresh(Scratch& scratch,
+                                                     const queuez::RosterAppearanceRefresh& refresh,
+                                                     const state::CharacterState& afterCharacter,
+                                                     std::size_t characterIndex,
+                                                     Prepared& prepared) noexcept;
 
 } // namespace sunrise::server::bap::encrypted::push::snapshot

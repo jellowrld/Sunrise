@@ -28,6 +28,18 @@ struct Equipped {
     std::size_t laneCount{};
 };
 
+/** Selects class-qualified art when present, otherwise the definition's generic arrangement. */
+[[nodiscard]] constexpr std::uint16_t
+select_art_arrangement(const details::Definition& detail,
+                       state::CharacterClass characterClass) noexcept {
+    const std::size_t classSlot = static_cast<std::size_t>(characterClass) + 1U;
+    if (classSlot < detail.artArrangementIndices.size()
+        && detail.artArrangementIndices[classSlot] != details::kUnavailableArtIndex) {
+        return detail.artArrangementIndices[classSlot];
+    }
+    return detail.artArrangementIndices.front();
+}
+
 /**
  * Resolves one equipped instance to its detail and the plugs its sockets hold.
  * The resolver has already applied the authored or native-default socket policy, so a lane that
@@ -41,20 +53,31 @@ struct Equipped {
                                     details::Definition& detail,
                                     Equipped& equipped) noexcept;
 
+/**
+ * Resolves one socket lane to the definition that supplies its native perks and stat changes.
+ * @param equipped Equipped base item and its visible socket plugs.
+ * @param lane Zero-based ordinary socket lane.
+ * @return Effective plug definition, or the unavailable sentinel for an invalid lane.
+ */
+[[nodiscard]] std::uint16_t resolve_effective_plug(const Equipped& equipped,
+                                                   std::size_t lane) noexcept;
+
 /** Fills every empty-valued field with the sentinel its reader tests for. */
 void apply_sentinels(layout::Appearance& appearance) noexcept;
 
 /**
  * Fills each equipped render row with its instance, definition, art and material pairs.
  * @param instances Resolved item instances belonging to one character.
+ * @param characterClass Class whose art rows are selected when a definition carries them.
  * @param appearance Appearance block receiving the render rows.
  * @return True when every instance addresses a render row.
  */
 [[nodiscard]] bool apply_render(const family4::loadout::ResolvedInstances& instances,
+                                state::CharacterClass characterClass,
                                 layout::Appearance& appearance) noexcept;
 
 /**
- * Fills the 12 ability buckets from the character's subclass and movement pick.
+ * Fills the 12 ability buckets from the character's subclass and ability picks.
  * @param character Validated authored character.
  * @param instances Resolved item instances belonging to that character.
  * @param appearance Appearance block receiving the buckets.

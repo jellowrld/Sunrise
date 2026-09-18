@@ -2,51 +2,60 @@
 
 #include <Windows.h>
 
-#include <algorithm>
+#include <cstddef>
+#include <span>
 
 #include "../../runtime/storage/internal.h"
 
 namespace sunrise::state::activity::forced {
 namespace {
 
-/** Bits in one byte, the step size of the descriptor's storage. */
+/** Bits in one byte. The name field is 40 of them, back to back. */
 constexpr std::size_t kBitsPerByte = 8;
-/** The top bit of a byte, where every packed field starts. */
+/** Every name byte is encoded with this bias, and padding is a biased zero. */
+constexpr unsigned kPackageNameBias = 128;
+/** The most significant bit of a byte, where each packed field starts. */
 constexpr unsigned kHighBit = 0x80;
-/** Every package-name element is one biased byte. */
-constexpr std::uint8_t kNameElementBias = 0x80;
 
 /**
- * Rewrites the package name inside one captured descriptor.
- * The field is a fixed 40 elements, so the descriptor keeps its length and every field
- * around the name keeps its bits.
- * @param selection Destination holding the captured descriptor.
- * @param name Forced package name.
- * @param length Bytes of that name.
- * @return True when the name field is inside the captured bits and was rewritten.
+ * Writes one byte into bit-packed storage at a bit offset.
+ * @param bits Storage large enough to hold the whole byte at that offset.
+ * @param bitOffset First bit of the byte.
+ * @param value Byte to write, most significant bit first.
  */
-[[nodiscard]] bool
-rewrite_descriptor_name(destination::DestinationSelection& selection,
-                        const std::array<char, destination::kPackageNameCapacity>& name,
-                        std::size_t length) noexcept {
-    const std::size_t fieldBits = destination::kPackageNameCapacity * kBitsPerByte;
+void write_byte(std::span<std::byte> bits, std::size_t bitOffset, unsigned value) noexcept {
+    for (std::size_t index = 0; index < kBitsPerByte; ++index) {
+        const std::size_t bit = bitOffset + index;
+        std::byte& target = bits[bit / kBitsPerByte];
+        const unsigned mask = kHighBit >> (bit % kBitsPerByte);
+        const bool set = (value >> (kBitsPerByte - 1 - index) & 1U) != 0;
+        target = static_cast<std::byte>(set ? static_cast<unsigned>(target) | mask
+                                            : static_cast<unsigned>(target) & ~mask);
+    }
+}
+
+/**
+ * Rewrites the captured descriptor's package name with the forced one.
+ * @param selection Committed destination holding the captured bits.
+ * @param value Forced destination whose name replaces the captured one.
+ * @return True when the whole 40-byte field sat inside the captured bits.
+ */
+[[nodiscard]] bool rename_descriptor(destination::DestinationSelection& selection,
+                                     const ForcedDestination& value) noexcept {
+    const std::size_t nameBits = destination::kPackageNameCapacity * kBitsPerByte;
     if (!selection.hasDescriptorName || selection.descriptorBitLength == 0
-        || selection.descriptorNameBit + fieldBits > selection.descriptorBitLength) {
+        || selection.descriptorNameBit + nameBits > selection.descriptorBitLength) {
         return false;
     }
-    for (std::size_t element = 0; element < destination::kPackageNameCapacity; ++element) {
-        // The field is fixed width, so every element past the name is written as a biased zero.
-        const auto character =
-            element < length ? static_cast<std::uint8_t>(name[element]) : std::uint8_t{};
-        const auto encoded = static_cast<unsigned>(character + kNameElementBias);
-        for (std::size_t bit = 0; bit < kBitsPerByte; ++bit) {
-            const std::size_t at = selection.descriptorNameBit + (element * kBitsPerByte) + bit;
-            std::byte& target = selection.descriptorBits[at / kBitsPerByte];
-            const unsigned mask = kHighBit >> (at % kBitsPerByte);
-            const bool set = (encoded >> (kBitsPerByte - 1 - bit) & 1U) != 0;
-            target = static_cast<std::byte>(set ? static_cast<unsigned>(target) | mask
-                                                : static_cast<unsigned>(target) & ~mask);
-        }
+    for (std::size_t index = 0; index < destination::kPackageNameCapacity; ++index) {
+        // Past the name the field is padding, and a biased zero decodes outside the name charset,
+        // which is what ends the name.
+        const unsigned character = index < value.packageNameLength
+                                       ? static_cast<unsigned char>(value.packageName[index])
+                                       : 0U;
+        write_byte(selection.descriptorBits,
+                   selection.descriptorNameBit + index * kBitsPerByte,
+                   character + kPackageNameBias & 0xFFU);
     }
     return true;
 }
@@ -78,6 +87,13 @@ void clear() noexcept {
     ReleaseSRWLockExclusive(&runtime::storage::g_stateLock);
 }
 
+/** @return True while the stored selection is complete and its switch is on. */
+bool override_active() noexcept {
+    ForcedDestination value{};
+    snapshot(value);
+    return active(value);
+}
+
 /** Overwrites one committed destination with the forced one. */
 bool apply(destination::DestinationSelection& selection) noexcept {
     ForcedDestination value{};
@@ -91,13 +107,18 @@ bool apply(destination::DestinationSelection& selection) noexcept {
         selection.packageName[index] = static_cast<std::int8_t>(value.packageName[index]);
     }
     selection.packageNameLength = value.packageNameLength;
-    // All three are absent when a destination is forced rather than picked. Many package names
-    // map to several definitions, so no index can be derived from a name.
+    // Many package names map to several definitions, so no index can be derived from a name: an
+    // operator who names one gets it. The from-side stays absent, because it feeds the requested
+    // and current-activity pushes and the client did ask from somewhere else.
     selection.reason = destination::kMinimumReason;
-    selection.previousActivityIndex = destination::kAbsentActivityIndex;
-    selection.activityIndex = destination::kAbsentActivityIndex;
+    selection.sourceActivityIndex = destination::kAbsentActivityIndex;
+    selection.activityIndex = value.hasActivityIndex
+                                  ? static_cast<std::int16_t>(value.activityIndex)
+                                  : destination::kAbsentActivityIndex;
     selection.elementIndex = destination::kAbsentElementIndex;
     selection.hasElementIndex = false;
+    selection.selectionNonce = 0;
+    selection.hasSelectionNonce = false;
     // The client named its arrival for the destination it picked, so both wire hashes go with it.
     selection.arrivalBubbleHash = 0;
     selection.hasArrivalBubbleHash = false;
@@ -107,13 +128,15 @@ bool apply(destination::DestinationSelection& selection) noexcept {
     selection.hasArrivalBubbleOverride = true;
     selection.sliceSetOverride = value.sliceSet;
     selection.hasSliceSetOverride = true;
-    // With no set chosen the destination's own fallback stands: `default` where the map has one,
-    // and the absent hash where it does not, which leaves the Client its loaded-world search.
-    selection.spawnSetOverride = value.hasSpawnSetHash ? value.spawnSetHash : value.spawnFallback;
+    // With no set chosen the absent hash goes out, so the Client searches the loaded world itself.
+    // A map-wide set is not proof that the arrival bubble holds one of its points.
+    selection.spawnSetOverride = value.hasSpawnSetHash ? value.spawnSetHash : kAbsentSpawnSetHash;
     selection.hasSpawnSetOverride = true;
-    // Only the name inside the descriptor is rewritten. Re-encoding a small one drops the fields
-    // with no known name, which leaves the Client's waiting overlay on screen.
-    if (!rewrite_descriptor_name(selection, value.packageName, value.packageNameLength)) {
+    // The Client authors this descriptor and the host replays it. Rebuilding it from named fields
+    // drops the ones with no name, and the Client then holds its lobby on Waiting for Other
+    // Players.
+    if (!rename_descriptor(selection, value)) {
+        // Nothing usable was captured, so the reconstructed descriptor goes out instead.
         selection.descriptorBits = {};
         selection.descriptorBitLength = 0;
         selection.descriptorNameBit = 0;

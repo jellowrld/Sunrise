@@ -2,8 +2,16 @@
 
 #include <Windows.h>
 
+#include <array>
+#include <cstdio>
+#include <limits>
+#include <string_view>
+
+#include "../../../../core/logging/log.h"
 #include "../../../../middleware/bap/matchmaking/request/matchmaking_request_parser.h"
 #include "../../../../middleware/bap/matchmaking/response/matchmaking_response_encoder.h"
+#include "../../../../state/activity/defaults/activity_defaults_snapshot.h"
+#include "../../../../state/activity_sdk/runtime.h"
 
 namespace sunrise::server::bap::encrypted::matchmaking {
 namespace {

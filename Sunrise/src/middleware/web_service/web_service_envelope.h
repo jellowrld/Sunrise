@@ -5,12 +5,30 @@
 #include <limits>
 #include <span>
 
+#include "../encoding/bit_writer.h"
+
 namespace sunrise::middleware::web_service {
 
 /** The 6-byte Web Service header holds a big-endian opcode and transaction id. */
 inline constexpr std::size_t kEnvelopeHeaderSize = sizeof(std::uint16_t) + sizeof(std::uint32_t);
-/** Every response ends with two cleared optional envelope fields. */
+/** Every response ends with two optional byte blobs, each behind one presence bit. */
 inline constexpr std::uint8_t kAbsentTrailerWidth = 2;
+inline constexpr std::uint8_t kTrailerPresenceWidth = 1;
+/** A present blob carries a 16-bit byte length, then its bytes, not byte aligned. */
+inline constexpr std::uint8_t kTrailerLengthWidth = 16;
+inline constexpr std::size_t kTrailerBlobCapacity = 0xFFFF;
+/**
+ * Status value of a reply that publishes no Family-4 revision.
+ * The Client's version wait skips its object-store compare on this value and completes at once.
+ * Logical INT32_MIN, the descriptor's own zero, is read as a revision instead.
+ */
+inline constexpr std::int32_t kNoFamily4Publication = -1;
+/**
+ * Status code of a refused operation.
+ * The descriptor biases logical zero to the wire success the Client expects, so any other logical
+ * value refuses. The five bits hold no error taxonomy, so one code covers every reason.
+ */
+inline constexpr std::int32_t kRefusedStatusCode = 1;
 
 /** Parsed request header and borrowed bit-packed payload. */
 struct Message {
@@ -32,6 +50,7 @@ enum class ResponseShape : std::uint8_t {
 /** Logical status values encoded with the protocol descriptor biases. */
 struct StatusResponse {
     std::int32_t code{};
+    /** Descriptor zero. A reply feeding the Family-4 wait must set a revision or the constant. */
     std::int32_t value{(std::numeric_limits<std::int32_t>::min)()};
     bool trailingBool{};
 };
@@ -58,5 +77,47 @@ struct StatusResponse {
                                    const StatusResponse& status,
                                    std::span<std::byte> output,
                                    std::size_t& written) noexcept;
+
+/**
+ * Writes the echoed header at the front of staging storage.
+ * @param request Parsed request whose opcode and transaction id are echoed.
+ * @param staging Response storage sized for the largest body this opcode can produce.
+ * @return Bit writer positioned on the payload that follows the header.
+ */
+[[nodiscard]] encoding::bits::Writer begin_response(const Message& request,
+                                                    std::span<std::byte> staging) noexcept;
+
+/**
+ * Closes the payload with the absent trailer fields and publishes the staged response.
+ * Nothing reaches the output unless the whole response fits it.
+ * @param writer Payload writer returned by begin_response.
+ * @param encoded False when an earlier payload field did not fit.
+ * @param staging Storage begin_response wrote the header into.
+ * @param output Caller-owned svc-11 body storage.
+ * @param written Receives encoded response body bytes, or zero when the response is refused.
+ * @return True when the payload closed and the whole response fit the output.
+ */
+[[nodiscard]] bool finish_response(encoding::bits::Writer& writer,
+                                   bool encoded,
+                                   std::span<const std::byte> staging,
+                                   std::span<std::byte> output,
+                                   std::size_t& written) noexcept;
+
+/**
+ * Closes the payload with the first blob present and the second absent, then publishes it.
+ * @param writer Payload writer returned by begin_response.
+ * @param encoded False when an earlier payload field did not fit.
+ * @param blob Bytes of the first trailer blob, at most kTrailerBlobCapacity.
+ * @param staging Storage begin_response wrote the header into.
+ * @param output Caller-owned svc-11 body storage.
+ * @param written Receives encoded response body bytes, or zero when the response is refused.
+ * @return True when the payload closed and the whole response fit the output.
+ */
+[[nodiscard]] bool finish_response_with_blob(encoding::bits::Writer& writer,
+                                             bool encoded,
+                                             std::span<const std::byte> blob,
+                                             std::span<const std::byte> staging,
+                                             std::span<std::byte> output,
+                                             std::size_t& written) noexcept;
 
 } // namespace sunrise::middleware::web_service

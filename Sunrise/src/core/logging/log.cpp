@@ -2,11 +2,17 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <shared_mutex>
 
 #include "../filesystem/path.h"
+#include "core/threading/srw_lock.h"
 #include "snapshot/internal.h"
 
 namespace sunrise::core::log {
@@ -27,14 +33,24 @@ constexpr std::wstring_view kPreviousLogSuffix = L".old";
 constexpr std::string_view kLineEnding = "\r\n";
 /** One trailing null byte is kept for the debugger sink. */
 constexpr std::size_t kLineTerminatorBytes = 1;
+/** An elapsed line is one event, a duration and an outcome, so it needs less than a full line. */
+constexpr std::size_t kElapsedCapacity = 128;
+/** Uppercase digits for the hex traces, which are read beside hex dumps of the same bytes. */
+constexpr std::string_view kHexDigits = "0123456789ABCDEF";
+/** One byte prints as two hex digits, which is the room each appended byte needs. */
+constexpr std::size_t kHexDigitsPerByte = 2;
 /** Event text stops before the CRLF and the trailing null. */
 constexpr std::size_t kEventTextCapacity =
     kLineCapacity - kLineEnding.size() - kLineTerminatorBytes;
+/** Longest " t=" field: the key plus a 64-bit millisecond count. */
+constexpr std::size_t kStampCapacity = 32;
 
 struct LogState {
-    SRWLOCK lock{SRWLOCK_INIT};
+    threading::SrwLock lock{};
     std::array<std::atomic<Level>, static_cast<std::size_t>(Channel::count)> levels{};
     HANDLE file{INVALID_HANDLE_VALUE};
+    /** Tick the sinks opened on. Every line carries its offset from this, so stalls are visible. */
+    ULONGLONG startTick{};
     bool debuggerSink{};
     bool initialized{};
 };
@@ -123,7 +139,7 @@ Settings defaults() noexcept {
 
 /** Applies log thresholds and opens the optional file sink. */
 bool initialize(void* module, const Settings& settings) noexcept {
-    AcquireSRWLockExclusive(&g_log.lock);
+    const std::lock_guard lock(g_log.lock);
     // Resetting under the lifetime lock prevents an admitted writer from repopulating stale view.
     snapshot::internal::reset();
     if (g_log.file != INVALID_HANDLE_VALUE) {
@@ -132,6 +148,7 @@ bool initialize(void* module, const Settings& settings) noexcept {
     }
     g_log.initialized = false;
     g_log.debuggerSink = settings.debuggerSink;
+    g_log.startTick = GetTickCount64();
     for (std::size_t index = 0; index < g_log.levels.size(); ++index) {
         g_log.levels[index].store(settings.levels[index], std::memory_order_relaxed);
     }
@@ -146,13 +163,13 @@ bool initialize(void* module, const Settings& settings) noexcept {
             level.store(Level::off, std::memory_order_relaxed);
         }
     }
-    ReleaseSRWLockExclusive(&g_log.lock);
     return ready;
 }
 
 /** Closes the optional sink and clears the bounded in-memory view. */
 void shutdown() noexcept {
-    AcquireSRWLockExclusive(&g_log.lock);
+    const std::lock_guard lock(g_log.lock);
+
     g_log.initialized = false;
     for (std::atomic<Level>& level : g_log.levels) {
         level.store(Level::off, std::memory_order_relaxed);
@@ -164,7 +181,6 @@ void shutdown() noexcept {
     }
     // The same lifetime lock excludes writers until both sinks and retained entries are empty.
     snapshot::internal::reset();
-    ReleaseSRWLockExclusive(&g_log.lock);
 }
 
 /** Writes one line straight to the debugger, bypassing the sinks and every threshold. */
@@ -181,9 +197,8 @@ void early(std::string_view event) noexcept {
 
 /** Reports whether an event would be emitted, so callers can skip the cost of building one. */
 bool accepts(Channel channel, Level level) noexcept {
-    AcquireSRWLockShared(&g_log.lock);
+    const std::shared_lock lock(g_log.lock);
     const bool admitted = g_log.initialized && enabled(channel, level);
-    ReleaseSRWLockShared(&g_log.lock);
     return admitted;
 }
 
@@ -195,17 +210,27 @@ void write(Channel channel, Level level, std::string_view event) noexcept {
         return;
     }
 
-    AcquireSRWLockShared(&g_log.lock);
+    const std::shared_lock lock(g_log.lock);
     if (!g_log.initialized || !enabled(channel, level)) {
-        ReleaseSRWLockShared(&g_log.lock);
         return;
     }
+
+    std::array<char, kStampCapacity> stamp{};
+    const int stamped =
+        std::snprintf(stamp.data(),
+                      stamp.size(),
+                      " t=%llu ",
+                      static_cast<unsigned long long>(GetTickCount64() - g_log.startTick));
 
     std::array<char, kLineCapacity> line{};
     std::size_t length = append(line, 0, kChannelNames[channelIndex], kEventTextCapacity);
     length = append(line, length, " level=", kEventTextCapacity);
     length = append(line, length, kLevelNames[levelIndex], kEventTextCapacity);
-    length = append(line, length, " ", kEventTextCapacity);
+    length = append(line,
+                    length,
+                    stamped > 0 ? std::string_view(stamp.data(), static_cast<std::size_t>(stamped))
+                                : std::string_view(" "),
+                    kEventTextCapacity);
     length = append(line, length, event, kEventTextCapacity);
     const std::size_t snapshotLength = length;
     std::memcpy(line.data() + length, kLineEnding.data(), kLineEnding.size());
@@ -224,7 +249,65 @@ void write(Channel channel, Level level, std::string_view event) noexcept {
     g_writers.fetch_sub(1, std::memory_order_acq_rel);
     // Record after sink writes while the shared lifetime lock still excludes shutdown reset.
     snapshot::internal::record(channel, level, std::string_view(line.data(), snapshotLength));
-    ReleaseSRWLockShared(&g_log.lock);
+}
+
+/** Formats and emits one structured event when allowed by the channel threshold. */
+void writef(Channel channel, Level level, const char* format, ...) noexcept {
+    if (format == nullptr || !accepts(channel, level)) {
+        return;
+    }
+    std::array<char, kLineCapacity> line{};
+    va_list arguments;
+    va_start(arguments, format);
+    const int count = std::vsnprintf(line.data(), line.size(), format, arguments);
+    va_end(arguments);
+    if (count <= 0) {
+        return;
+    }
+    const std::size_t length = (std::min)(static_cast<std::size_t>(count), line.size() - 1);
+    write(channel, level, std::string_view(line.data(), length));
+}
+
+/** Formats and emits one debug event carrying a duration in the ms field. */
+void write_elapsed(Channel channel,
+                   std::string_view event,
+                   unsigned long long startedTick,
+                   std::string_view result) noexcept {
+    if (!accepts(channel, Level::debug)) {
+        return;
+    }
+    const unsigned long long elapsed = GetTickCount64() - startedTick;
+    std::array<char, kElapsedCapacity> line{};
+    const int written = std::snprintf(line.data(),
+                                      line.size(),
+                                      "%.*s ms=%llu result=%.*s",
+                                      static_cast<int>(event.size()),
+                                      event.data(),
+                                      elapsed,
+                                      static_cast<int>(result.size()),
+                                      result.data());
+    if (written <= 0) {
+        return;
+    }
+    // snprintf reports the length before truncation, so the emitted view is clamped to the buffer.
+    const auto length =
+        std::min(static_cast<std::size_t>(written), line.size() - kLineTerminatorBytes);
+    write(channel, Level::debug, {line.data(), length});
+}
+
+/** Appends bytes as uppercase hex to a line that already holds its key prefix. */
+bool append_hex(std::span<char> line,
+                std::size_t& length,
+                std::span<const std::byte> bytes) noexcept {
+    for (const std::byte byte : bytes) {
+        if (length + kHexDigitsPerByte >= line.size()) {
+            return false;
+        }
+        const auto value = std::to_integer<unsigned>(byte);
+        line[length++] = kHexDigits[(value >> 4U) & 0xFU];
+        line[length++] = kHexDigits[value & 0xFU];
+    }
+    return true;
 }
 
 /** @return True while a sink write is in progress. */

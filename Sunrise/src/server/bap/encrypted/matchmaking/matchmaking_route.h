@@ -4,6 +4,7 @@
 #include <span>
 
 #include "../../../../state/matchmaking/matchmaking_state.h"
+#include "../../../../state/runtime/runtime.h"
 
 namespace sunrise::server::bap::encrypted::matchmaking {
 

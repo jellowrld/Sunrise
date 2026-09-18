@@ -2,12 +2,15 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <string_view>
 
+#include "../../logging/log.h"
 #include "busy.h"
 
 namespace sunrise::core::ui::busy {
@@ -22,6 +25,8 @@ constexpr ULONGLONG kPresentIdleMilliseconds = 250;
 /** The Present hook is installed just before the first raise, so the first frame gets this long
  * before the overlay is given up on. */
 constexpr ULONGLONG kFirstPresentGraceMilliseconds = 250;
+/** Longest a deferred caller waits for an overlay frame while the game is presenting. */
+constexpr ULONGLONG kEarlyWaitMilliseconds = 1000;
 /** An overlay drawn this recently is still on screen, so the next task need not wait for it. */
 constexpr ULONGLONG kVisibleRecentlyMilliseconds = 250;
 /** One millisecond yields the core between polls of the present counter. */
@@ -49,10 +54,13 @@ struct EarlyState {
     std::uint32_t start{};
     ULONGLONG armedTick{};
     bool armed{};
+    bool expiryReported{};
 };
 
 SRWLOCK g_earlyLock{SRWLOCK_INIT};
 std::array<EarlyState, kTaskCount> g_early{};
+SRWLOCK g_progressLock{SRWLOCK_INIT};
+std::array<internal::Progress, kTaskCount> g_progress{};
 
 /** @return The task's single bit in the running mask. */
 [[nodiscard]] unsigned bit_of(Task task) noexcept {
@@ -115,15 +123,28 @@ bool raise_early(Task task) noexcept {
         early.armedTick = now;
         early.armed = true;
     }
+    const ULONGLONG waited = now - early.armedTick;
     bool waiting = false;
+    bool expired = false;
     if (g_lastPresentTick.load(std::memory_order_acquire) == 0) {
         // No frame has passed through the hook yet, which is expected on the call that
         // installed it. The game gets a bounded chance to draw one.
-        waiting = now - early.armedTick < kFirstPresentGraceMilliseconds;
+        waiting = waited < kFirstPresentGraceMilliseconds;
     } else if (drawing()) {
-        waiting = g_shownPresents.load(std::memory_order_acquire) - early.start < kRequiredPresents;
+        const bool shown =
+            g_shownPresents.load(std::memory_order_acquire) - early.start >= kRequiredPresents;
+        // Bounded: an overlay that never completes must not defer the caller for the whole run.
+        waiting = !shown && waited < kEarlyWaitMilliseconds;
+        expired = !shown && !waiting && !early.expiryReported;
+        early.expiryReported = early.expiryReported || expired;
     }
     ReleaseSRWLockExclusive(&g_earlyLock);
+    if (expired) {
+        // The sink takes a process-wide lock, so it is written outside the state lock.
+        core::log::write(core::log::Channel::core,
+                         core::log::Level::warn,
+                         "ev=busy stage=early result=expired reason=no_overlay_frame");
+    }
     return waiting;
 }
 
@@ -133,6 +154,27 @@ void end(Task task) noexcept {
     g_running.fetch_and(~bit_of(task), std::memory_order_acq_rel);
     g_early[static_cast<std::size_t>(task)] = {};
     ReleaseSRWLockExclusive(&g_earlyLock);
+    AcquireSRWLockExclusive(&g_progressLock);
+    g_progress[static_cast<std::size_t>(task)] = {};
+    ReleaseSRWLockExclusive(&g_progressLock);
+}
+
+/** Publishes one task's latest real progress for the loading overlay. */
+void set_progress(Task task,
+                  std::uint32_t current,
+                  std::uint32_t total,
+                  std::string_view detail,
+                  bool determinate) noexcept {
+    internal::Progress next{};
+    const std::size_t length = (std::min)(detail.size(), next.detail.size() - 1U);
+    std::copy_n(detail.data(), length, next.detail.data());
+    next.current = current;
+    next.total = total;
+    next.available = true;
+    next.determinate = determinate && total != 0;
+    AcquireSRWLockExclusive(&g_progressLock);
+    g_progress[static_cast<std::size_t>(task)] = next;
+    ReleaseSRWLockExclusive(&g_progressLock);
 }
 
 /** Records one finished present. */
@@ -148,6 +190,13 @@ namespace internal {
 /** @return Mask of started tasks. */
 unsigned running() noexcept {
     return g_running.load(std::memory_order_acquire);
+}
+
+Progress progress(Task task) noexcept {
+    AcquireSRWLockShared(&g_progressLock);
+    const Progress copy = g_progress[static_cast<std::size_t>(task)];
+    ReleaseSRWLockShared(&g_progressLock);
+    return copy;
 }
 
 /** @param threadId Thread that draws frames. */

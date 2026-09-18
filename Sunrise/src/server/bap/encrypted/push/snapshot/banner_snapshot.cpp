@@ -4,6 +4,7 @@
 #include "../../../../../middleware/datagen/character_record/character_record_encoder.h"
 #include "../../../../../middleware/datagen/definitions.h"
 #include "../../../../../middleware/datagen/family4/loadout/loadout_resolver.h"
+#include "../../../../../state/account/account_state.h"
 #include "../../../../../state/equipment/light/resolution/configured_equipment_light_resolver.h"
 #include "../../../../../state/runtime/runtime.h"
 #include "internal.h"
@@ -13,9 +14,6 @@ namespace sunrise::server::bap::encrypted::push::snapshot {
 namespace {
 
 namespace character_record = middleware::datagen::character_record;
-
-/** The anchor and the record it names are the two objects every family-zero frame upserts. */
-constexpr std::size_t kBannerUpsertCount = 2;
 
 } // namespace
 
@@ -30,14 +28,17 @@ bool prepare_banner(Scratch& scratch,
     if (reservation.rawWriteOffset > scratch.plaintext.size()) {
         return false;
     }
+    // The selected character, or the first one before any pick. The record accepts a snapshot only
+    // during the boot burst, so a refusal here costs the whole family for the run.
+    const std::uint64_t named = state::account::banner_character_soid(account);
     std::size_t selectedIndex = account.characterCount;
     for (std::size_t index = 0; index < account.characterCount; ++index) {
-        if (account.characters[index].selected) {
+        if (account.characters[index].soid == named) {
             selectedIndex = index;
             break;
         }
     }
-    if (selectedIndex == account.characterCount) {
+    if (named == 0 || selectedIndex == account.characterCount) {
         return false;
     }
 
@@ -77,7 +78,7 @@ bool prepare_banner(Scratch& scratch,
         staged.objects[objectCount] = middleware::queuez::Object{
             middleware::datagen::kBannerCharacterObjectId,
             previousCharacter,
-            middleware::queuez::Encoding::raw,
+            middleware::queuez::Encoding::none,
             {},
         };
         ++objectCount;
@@ -107,15 +108,124 @@ bool prepare_banner(Scratch& scratch,
     ++objectCount;
     compressedExtent += compressedSize;
     staged.compressedClearSize = (std::max)(reservation.compressedClearSize, compressedExtent);
+    // Always a full snapshot, even when a release rides with it. The accept gate disarms the
+    // record's expiry timer before it tests this bit, so a body without it leaves a subscribed
+    // record stuck until it times out. The prune keeps this message's own headers, release too.
     staged.family = middleware::queuez::Family{
         middleware::datagen::kBannerFamily,
         familyRootSoid,
         version,
-        previousCharacter != 0 ? std::uint8_t{0} : middleware::queuez::kFullSnapshotFlag,
+        middleware::queuez::kFullSnapshotFlag,
         std::span(staged.objects).first(objectCount),
     };
-    static_assert(kBannerUpsertCount == 2);
     return commit(staged, prepared);
+}
+
+/** Builds one in-place Family-0 record upsert from an uncommitted equipment after-image. */
+bool prepare_character_appearance_refresh(Scratch& scratch,
+                                          const queuez::CharacterAppearanceRefresh& refresh,
+                                          const state::CharacterState& afterCharacter,
+                                          std::size_t characterIndex,
+                                          std::uint8_t nativeEquipmentSlot,
+                                          bool replaceCharacterRecord,
+                                          Prepared& prepared) noexcept {
+    const Reservation reservation = reserve_prior(scratch, prepared);
+    if (reservation.rawWriteOffset > scratch.plaintext.size()
+        || reservation.compressedWriteOffset > scratch.sealed.size()) {
+        return report_failure("equip_appearance_reservation");
+    }
+
+    state::AccountState account = state::account_snapshot();
+    if (refresh.characterSoid == 0 || afterCharacter.soid != refresh.characterSoid
+        || characterIndex >= account.characterCount
+        || account.characters[characterIndex].soid != refresh.characterSoid
+        || !refresh.after.family0Active || refresh.after.family0Character != refresh.characterSoid
+        || refresh.after.family4RootSoid == 0
+        || account.primarySoid != refresh.after.family4RootSoid) {
+        return report_failure("equip_appearance_mutation");
+    }
+    account.characters[characterIndex] = afterCharacter;
+    if (!state::account::valid(account)
+        || state::account::selected_character_soid(account) != refresh.characterSoid) {
+        return report_failure("equip_appearance_selection");
+    }
+
+    middleware::datagen::family4::loadout::ResolvedInstances instances{};
+    std::int32_t light = 0;
+    if (!middleware::datagen::family4::loadout::resolve_instances(
+            account, characterIndex, instances)
+        || !state::equipment::light::resolution::character_light(account, characterIndex, light)) {
+        return report_failure("equip_appearance_resolve");
+    }
+
+    // The banner-facing emblem consumers bind through the Family-0 anchor, not the character
+    // record, so an emblem move must touch the unchanged anchor as well. That dirties those
+    // consumers without releasing either resident key.
+    constexpr std::uint8_t kEmblemEquipmentSlot = 13;
+    const bool refreshAnchor = nativeEquipmentSlot == kEmblemEquipmentSlot;
+    const std::size_t anchorSize = refreshAnchor ? character_record::kFamily0AnchorSize : 0U;
+    const std::size_t rawSize = anchorSize + character_record::kFamily0RecordSize;
+    const auto rawStorage = std::span(scratch.plaintext).subspan(reservation.rawWriteOffset);
+    if (rawSize > rawStorage.size()) {
+        return report_failure("equip_appearance_storage");
+    }
+    const auto anchor = rawStorage.first(anchorSize);
+    const auto record = rawStorage.subspan(anchorSize, character_record::kFamily0RecordSize);
+    if ((refreshAnchor
+         && !character_record::encode_family0_anchor(
+             account.primarySoid, refresh.characterSoid, anchor))
+        || !character_record::encode_family0(afterCharacter, instances, light, record)) {
+        return report_failure("equip_appearance_encode");
+    }
+
+    Prepared staged{};
+    staged.rawClearSize =
+        (std::max)(reservation.rawClearSize, reservation.rawWriteOffset + rawSize);
+    std::size_t compressedExtent = reservation.compressedWriteOffset;
+    std::size_t objectCount = 0;
+    if (replaceCharacterRecord) {
+        staged.objects[objectCount++] = middleware::queuez::Object{
+            middleware::datagen::kBannerCharacterObjectId,
+            refresh.characterSoid,
+            middleware::queuez::Encoding::none,
+            {},
+        };
+    }
+    if (!append_object(scratch,
+                       record,
+                       middleware::datagen::kBannerCharacterObjectId,
+                       refresh.characterSoid,
+                       staged.objects[objectCount++],
+                       compressedExtent)) {
+        clear_after(scratch, reservation);
+        return report_failure("equip_appearance_object");
+    }
+    // On an incremental refresh the record is already resident. Publish its new body first and
+    // touch the anchor second, so an anchor-driven banner observer resolves the new emblem rather
+    // than the prior record during the same family update.
+    if (refreshAnchor
+        && !append_object(scratch,
+                          anchor,
+                          middleware::datagen::kBannerAnchorObjectId,
+                          account.primarySoid,
+                          staged.objects[objectCount++],
+                          compressedExtent)) {
+        clear_after(scratch, reservation);
+        return report_failure("equip_appearance_anchor");
+    }
+    staged.compressedClearSize = (std::max)(reservation.compressedClearSize, compressedExtent);
+    staged.family = middleware::queuez::Family{
+        middleware::datagen::kBannerFamily,
+        refresh.after.family4RootSoid,
+        refresh.after.family0Version,
+        0,
+        std::span(staged.objects).first(objectCount),
+    };
+    if (!commit(staged, prepared)) {
+        clear_after(scratch, reservation);
+        return report_failure("equip_appearance_commit");
+    }
+    return true;
 }
 
 } // namespace sunrise::server::bap::encrypted::push::snapshot

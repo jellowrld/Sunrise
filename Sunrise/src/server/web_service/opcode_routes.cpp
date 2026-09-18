@@ -18,11 +18,17 @@ constexpr auto kStatusPairOpcodes = std::to_array<std::uint16_t>({
     802,  803,  804,  902,  903,  904,  905,  1103, 1201, 1202, 1203, 1205, 1206, 1207,
     1208, 1209, 1210, 1211, 1212, 1213, 1215, 1216, 1219, 1220, 1221, 1222, 1223, 1224,
     1227, 1228, 1229, 1230, 1236, 1238, 1240, 1243, 1307, 1309, 1310, 1401, 1615, 1616,
-    1617, 1618, 1701, 1702, 1801, 1802, 1803, 1820, 1821, 1901, 2002, 2300, 2400,
+    1617, 1618, 1701, 1702, 1801, 1802, 1803, 1820, 1821, 1901, 2002, 2200, 2300, 2400,
 });
 
-/** Opcodes whose status pair has one required trailing boolean field. */
+/** Opcodes whose status pair carries a trailing bool with no presence bit, so 38 bits. */
 constexpr auto kStatusPairBoolOpcodes = std::to_array<std::uint16_t>({104, 901});
+
+/** Opcodes whose response definition hands its status value to the Client's Family-4 wait. */
+constexpr auto kFamily4VersionOpcodes = std::to_array<std::uint16_t>({
+    105, 106, 402, 403, 404, 405, 406, 501,  502,  503,  504,  505,  601,  701,  702,
+    801, 802, 804, 901, 903, 904, 905, 1801, 1802, 1820, 1821, 1901, 2002, 2400,
+});
 
 template <std::size_t Size>
 [[nodiscard]] bool contains(const std::array<std::uint16_t, Size>& values,
@@ -49,6 +55,11 @@ void resolve_response_shape(std::uint16_t opcode,
     }
     // Unknown opcodes still get a correlated echo so the client task completes.
     shape = middleware::web_service::ResponseShape::generic;
+}
+
+/** Reports whether a reply's status value feeds the Client's Family-4 version wait. */
+bool awaits_family4_version(std::uint16_t opcode) noexcept {
+    return contains(kFamily4VersionOpcodes, opcode);
 }
 
 } // namespace sunrise::server::web_service

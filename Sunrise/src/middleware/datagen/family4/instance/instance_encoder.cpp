@@ -66,7 +66,7 @@ namespace {
     for (std::size_t index = 0; index < input.socketEntryStates.size(); ++index) {
         const SocketEntryState state = input.socketEntryStates[index];
         if (state != SocketEntryState::absent && state != SocketEntryState::ready
-            && state != SocketEntryState::active) {
+            && state != SocketEntryState::acquired && state != SocketEntryState::active) {
             return false;
         }
         if (index >= input.socketEntryCount && state != SocketEntryState::absent) {
@@ -142,11 +142,15 @@ bool encode(const ResolvedInstance& input, std::span<std::byte> output) noexcept
     object.roll.socketEntryListIndex = input.socketEntryListIndex;
 
     if (input.ordinarySockets.state == OrdinarySocketBlockState::present) {
+        // Both permit masks are filled. The plug walk reads the definition's declared plugs as
+        // well as this instance's lanes, and skips whichever source its mask leaves unset.
         object.ordinarySockets.activeMask = layout::kAllSocketBits;
+        object.ordinarySockets.definitionUnlockMask = layout::kAllSocketBits;
         for (std::size_t index = 0; index < input.ordinarySockets.plugs.size(); ++index) {
             const std::optional<std::uint16_t>& plug = input.ordinarySockets.plugs[index];
             if (plug.has_value()) {
                 object.ordinarySockets.sockets[index].plugDefinitionIndex = *plug;
+                // Auxiliary fields stay zero; nonzero values change the available plug choices.
             }
         }
     }

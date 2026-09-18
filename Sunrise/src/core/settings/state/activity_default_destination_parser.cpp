@@ -13,7 +13,7 @@ constexpr std::uint64_t kMaximumHash = (std::numeric_limits<std::uint32_t>::max)
 /** Fields needed for one complete authored destination and numeric fallback row. */
 enum class DestinationField : std::size_t {
     reason,
-    previousActivityIndex,
+    sourceActivityIndex,
     activityIndex,
     packageName,
     bubbleCount,
@@ -60,7 +60,6 @@ bool Parser::activity_settings(state::activity::defaults::ActivityDefaults& outp
         return false;
     }
     bool hasDefaultDestination = false;
-    bool hasArrivalOverrides = false;
     bool hasRosterKeyFromIdentity = false;
     bool hasRosterKeyOnAllSlots = false;
     if (consume('}')) {
@@ -76,11 +75,6 @@ bool Parser::activity_settings(state::activity::defaults::ActivityDefaults& outp
                 return false;
             }
             hasDefaultDestination = true;
-        } else if (key == "arrival_overrides") {
-            if (hasArrivalOverrides || !arrival_overrides(output)) {
-                return false;
-            }
-            hasArrivalOverrides = true;
         } else if (key == "roster_key_from_identity") {
             if (hasRosterKeyFromIdentity || !boolean(output.rosterKeyFromIdentity)) {
                 return false;
@@ -126,14 +120,14 @@ bool Parser::default_destination(state::activity::defaults::DefaultDestination& 
                 return false;
             }
             candidate.selection.reason = static_cast<std::int8_t>(value);
-        } else if (key == "previous_activity_index") {
+        } else if (key == "source_activity_index") {
             std::int64_t value = 0;
-            if (!mark(supplied, DestinationField::previousActivityIndex) || !signed_integer(value)
+            if (!mark(supplied, DestinationField::sourceActivityIndex) || !signed_integer(value)
                 || value < state::activity::destination::kAbsentActivityIndex
                 || value > state::activity::destination::kMaximumActivityIndex) {
                 return false;
             }
-            candidate.selection.previousActivityIndex = static_cast<std::int16_t>(value);
+            candidate.selection.sourceActivityIndex = static_cast<std::int16_t>(value);
         } else if (key == "activity_index") {
             std::int64_t value = 0;
             if (!mark(supplied, DestinationField::activityIndex) || !signed_integer(value)

@@ -8,6 +8,7 @@
 
 #include "../../../core/logging/log.h"
 #include "../../targets/game.h"
+#include "../network/investment/internal.h"
 
 namespace sunrise::client::hooks::retail_log {
 namespace {
@@ -21,15 +22,45 @@ constexpr std::size_t kNativeTextSize = 320;
 constexpr std::int32_t kUnregisteredSite = -1;
 /** Line storage holds the cleaned text plus its fixed key prefix. */
 constexpr std::size_t kEventCapacity = kNativeTextSize + 64;
-/** A late config load can reset all category thresholds, so set them again now and then. */
-constexpr unsigned kReassertInterval = 512;
+/** A late config load resets the thresholds, so set them again on this period. A count will not
+ *  do: a closed category emits fewer lines, so it advances slower and stays closed. */
+constexpr std::uint64_t kReassertIntervalMs = 2'000;
 /** How many categories the game's own verbosity table holds. */
 constexpr std::uint32_t kCategoryCount = 26;
 /** 0 is the game's loosest category threshold. A higher value logs less. */
 constexpr std::uint32_t kMostVerbose = 0;
+/** Native boundary after plug tables finish patching and before their derived views resume. */
+constexpr std::string_view kContentTablePatchingComplete =
+    "content_table_patching: patch contents have been cleared";
 
 thread_local bool g_inObserver{};
-volatile LONG g_sinceAssert{};
+/** Tick at which the next re-assert is due. Zero makes the first call assert. */
+volatile LONG64 g_nextAssertTick{};
+
+/**
+ * Reports whether the native text carries the content-table patch-completion boundary.
+ * @param text Borrowed native buffer, not guaranteed readable.
+ * @return True when the boundary line is present.
+ */
+[[nodiscard]] bool marks_patch_completion(const char* text) {
+    // Last offset in the native buffer that can still hold the whole boundary line.
+    constexpr std::size_t kLastStart = kNativeTextSize - kContentTablePatchingComplete.size();
+    __try {
+        for (std::size_t start = 0; start <= kLastStart && text[start] != '\0'; ++start) {
+            std::size_t match = 0;
+            while (match < kContentTablePatchingComplete.size()
+                   && text[start + match] == kContentTablePatchingComplete[match]) {
+                ++match;
+            }
+            if (match == kContentTablePatchingComplete.size()) {
+                return true;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return false;
+}
 
 /**
  * Copies the native text into fixed storage as one printable line.
@@ -96,6 +127,12 @@ __declspec(noinline) void __fastcall enqueue_body(std::int32_t siteId, const cha
     }
     if (outer) {
         if (siteId != kUnregisteredSite && text != nullptr) {
+            if (marks_patch_completion(text)) {
+                // Both must run before the native logger returns to investment initialization; a
+                // later tick races the caches that consume these descriptors.
+                network::investment::apply_socket_menu_routing();
+                network::investment::apply_lore_visibility();
+            }
             capture_line(siteId, text);
         }
         assert_verbosity();
@@ -119,7 +156,15 @@ void assert_verbosity() noexcept {
     if (!core::log::accepts(core::log::Channel::client, core::log::Level::debug)) {
         return;
     }
-    if (InterlockedIncrement(&g_sinceAssert) % kReassertInterval != 1) {
+    const auto now = static_cast<LONG64>(GetTickCount64());
+    const LONG64 due = g_nextAssertTick;
+    if (now < due) {
+        return;
+    }
+    // One claim per period, so concurrent funnel threads do not all reopen the table.
+    if (InterlockedCompareExchange64(
+            &g_nextAssertTick, now + static_cast<LONG64>(kReassertIntervalMs), due)
+        != due) {
         return;
     }
     const auto setter = reinterpret_cast<SetCategoryVerbosity>(

@@ -3,11 +3,14 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
+#include <new>
 #include <string_view>
 
 #include "../../../resources/resource.h"
 #include "../filesystem/path.h"
 #include "../logging/log.h"
+#include "parser.h"
 #include "settings.h"
 
 namespace sunrise::core::settings {
@@ -15,8 +18,8 @@ namespace {
 
 /** The JSON settings file is the only file stored directly in the owned folder. */
 constexpr std::wstring_view kSettingsFileSuffix = L"\\settings.json";
-/** Largest settings file accepted into fixed stack storage. */
-constexpr std::size_t kConfigCapacity = 64 * 1024;
+/** Largest settings file accepted into fixed storage. */
+constexpr std::size_t kConfigCapacity = 1024 * 1024;
 
 Settings g_settings = defaults();
 
@@ -40,11 +43,7 @@ Settings g_settings = defaults();
 }
 
 /**
- * Reports a settings file written against a different layout version.
- *
- * Nothing needs repair: the file is parsed on top of the built-in defaults, so an added key takes
- * its default and a removed key is skipped. This line is the only sign either happened.
- *
+ * Reports a settings version that differs from this build.
  * @param fileVersion Version read from the file, or zero when the key was missing.
  */
 void report_version(std::uint32_t fileVersion) noexcept {
@@ -63,12 +62,12 @@ void report_version(std::uint32_t fileVersion) noexcept {
 }
 
 /**
- * Copies the bundled default settings. An existing file is never overwritten.
+ * Borrows the default settings document out of the module resources.
  * @param module Loaded DLL holding the default JSON resource.
- * @param configPath Null-terminated destination path.
- * @return True when every bundled byte is written and the file closes cleanly.
+ * @param output Receives the resource bytes, owned by the module.
+ * @return True when the resource is present and not empty.
  */
-[[nodiscard]] bool write_default(void* module, const path::Buffer& configPath) noexcept {
+[[nodiscard]] bool bundled_document(void* module, std::string_view& output) noexcept {
     const HMODULE loadedModule = static_cast<HMODULE>(module);
     const HRSRC resource =
         FindResourceW(loadedModule, MAKEINTRESOURCEW(IDR_DEFAULT_SETTINGS), RT_RCDATA);
@@ -77,8 +76,24 @@ void report_version(std::uint32_t fileVersion) noexcept {
     }
     const DWORD size = SizeofResource(loadedModule, resource);
     const HGLOBAL loaded = LoadResource(loadedModule, resource);
-    const void* bytes = loaded != nullptr ? LockResource(loaded) : nullptr;
+    const auto* bytes =
+        loaded != nullptr ? static_cast<const char*>(LockResource(loaded)) : nullptr;
     if (size == 0 || bytes == nullptr) {
+        return false;
+    }
+    output = std::string_view(bytes, size);
+    return true;
+}
+
+/**
+ * Copies the bundled default settings. An existing file is never overwritten.
+ * @param module Loaded DLL holding the default JSON resource.
+ * @param configPath Null-terminated destination path.
+ * @return True when every bundled byte is written and the file closes cleanly.
+ */
+[[nodiscard]] bool write_default(void* module, const path::Buffer& configPath) noexcept {
+    std::string_view document;
+    if (!bundled_document(module, document)) {
         return false;
     }
     const HANDLE file = CreateFileW(configPath.chars.data(),
@@ -92,13 +107,28 @@ void report_version(std::uint32_t fileVersion) noexcept {
         return false;
     }
     DWORD written = 0;
-    bool complete = WriteFile(file, bytes, size, &written, nullptr) != FALSE && written == size;
+    const auto size = static_cast<DWORD>(document.size());
+    bool complete =
+        WriteFile(file, document.data(), size, &written, nullptr) != FALSE && written == size;
     complete = CloseHandle(file) != FALSE && complete;
     if (!complete) {
         // A half-written default must not become the next boot's settings.
         (void)DeleteFileW(configPath.chars.data());
     }
     return complete;
+}
+
+/**
+ * Drops a leading UTF-8 byte order mark.
+ * Common editors write one and the parser would read it as a stray token, which fails startup
+ * before the log opens.
+ * @param document Whole settings text as read from disk.
+ * @return The same text with any BOM removed.
+ */
+[[nodiscard]] std::string_view without_byte_order_mark(std::string_view document) noexcept {
+    // UTF-8 byte order mark. An editor writes it and the parser must not see it.
+    constexpr std::string_view kMark = "\xEF\xBB\xBF";
+    return document.starts_with(kMark) ? document.substr(kMark.size()) : document;
 }
 
 } // namespace
@@ -150,18 +180,36 @@ bool initialize(void* module) noexcept {
         return fail("too_large");
     }
 
-    std::array<char, kConfigCapacity> buffer{};
+    const std::unique_ptr<std::array<char, kConfigCapacity>> buffer{
+        new (std::nothrow) std::array<char, kConfigCapacity>{}};
+    if (!buffer) {
+        CloseHandle(readableFile);
+        return fail("allocate");
+    }
     DWORD read = 0;
     const bool readOk =
-        ReadFile(readableFile, buffer.data(), static_cast<DWORD>(size.QuadPart), &read, nullptr)
+        ReadFile(readableFile, buffer->data(), static_cast<DWORD>(size.QuadPart), &read, nullptr)
             != FALSE
         && read == size.QuadPart;
     const bool closed = CloseHandle(readableFile) != FALSE;
     if (!readOk || !closed) {
         return fail("read");
     }
+    std::string_view document = without_byte_order_mark(std::string_view(buffer->data(), read));
+    std::uint32_t version = 0;
+    if (!parser::Parser(document).parse_version(version)) {
+        return fail("version");
+    }
+    if (version < kSettingsVersion) {
+        if (!DeleteFileW(configPath.chars.data())) {
+            return fail("delete_old");
+        }
+        if (!write_default(module, configPath) || !bundled_document(module, document)) {
+            return fail("write_default");
+        }
+    }
     Settings parsed;
-    if (!parse(std::string_view(buffer.data(), read), parsed)) {
+    if (!parse(document, parsed)) {
         return fail("parse");
     }
     report_version(parsed.version);

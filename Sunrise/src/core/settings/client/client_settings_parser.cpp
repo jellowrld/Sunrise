@@ -10,10 +10,9 @@ bool Parser::client_settings(client::Settings& output) noexcept {
     client::Settings candidate = output;
     bool hasUserInterface = false;
     bool hasExternalServer = false;
-    bool hasFadeRelease = false;
-    bool hasForceJoinRequestReady = false;
-    bool hasPinReplicatedRecord = false;
-    bool hasHoldSpawn = false;
+    bool hasCustomBootflowTextures = false;
+    bool hasSocketMenuRouting = false;
+    bool hasRevealLoreBooks = false;
     if (consume('}')) {
         return true;
     }
@@ -32,26 +31,21 @@ bool Parser::client_settings(client::Settings& output) noexcept {
                 return false;
             }
             hasExternalServer = true;
-        } else if (key == "fade_release") {
-            if (hasFadeRelease || !boolean(candidate.fadeRelease)) {
+        } else if (key == "custom_bootflow_textures") {
+            if (hasCustomBootflowTextures || !boolean(candidate.customBootflowTextures)) {
                 return false;
             }
-            hasFadeRelease = true;
-        } else if (key == "force_join_request_ready") {
-            if (hasForceJoinRequestReady || !boolean(candidate.forceJoinRequestReady)) {
+            hasCustomBootflowTextures = true;
+        } else if (key == "socket_menu_routing") {
+            if (hasSocketMenuRouting || !boolean(candidate.socketMenuRouting)) {
                 return false;
             }
-            hasForceJoinRequestReady = true;
-        } else if (key == "pin_replicated_record") {
-            if (hasPinReplicatedRecord || !boolean(candidate.pinReplicatedRecord)) {
+            hasSocketMenuRouting = true;
+        } else if (key == "reveal_lore_books") {
+            if (hasRevealLoreBooks || !boolean(candidate.revealLoreBooks)) {
                 return false;
             }
-            hasPinReplicatedRecord = true;
-        } else if (key == "hold_spawn") {
-            if (hasHoldSpawn || !boolean(candidate.holdSpawn)) {
-                return false;
-            }
-            hasHoldSpawn = true;
+            hasRevealLoreBooks = true;
         } else if (!skip_value(0)) {
             return false;
         }

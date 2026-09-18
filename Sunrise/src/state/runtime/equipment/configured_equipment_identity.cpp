@@ -49,6 +49,40 @@ void mix_value(std::uint64_t& hash, std::uint32_t value) noexcept {
     }
 }
 
+/**
+ * Mixes one item's socket policy and every authored plug lane.
+ * The extraction pass reads a detail row for each authored plug, so a changed plug must rebuild.
+ * @param hash Mutable 64-bit FNV-1a accumulator.
+ * @param sockets Authored socket policy and lanes.
+ */
+void mix_sockets(std::uint64_t& hash, const account::inventory::Sockets& sockets) noexcept {
+    mix_byte(hash, static_cast<std::uint8_t>(sockets.policy));
+    mix_byte(hash, static_cast<std::uint8_t>(sockets.plugCount));
+    for (std::size_t lane = 0; lane < sockets.plugCount && lane < sockets.plugs.size(); ++lane) {
+        if (!sockets.plugs[lane].has_value()) {
+            mix_byte(hash, kAbsentItemMarker);
+            continue;
+        }
+        mix_byte(hash, kPresentItemMarker);
+        mix_value(hash, *sockets.plugs[lane]);
+    }
+}
+
+/** Mixes the installed-detail inputs shared by equipped and unequipped authored items. */
+void mix_item(std::uint64_t& hash, const account::inventory::Item& item) noexcept {
+    // SOIDs, quantity, gates and secrets stay outside build identity.
+    mix_value(hash, item.definitionHash);
+    mix_value(hash, static_cast<std::uint32_t>(item.level));
+    mix_sockets(hash, item.sockets);
+    // Mixed for every item because the ability bucket rows are keyed by these, so a changed pick
+    // must rebuild. They live on the item, so each owned subclass keeps its own picks.
+    mix_byte(hash, item.movementAbilityEntry);
+    mix_byte(hash, item.grenadeAbilityEntry);
+    mix_byte(hash, item.superAbilityEntry);
+    mix_byte(hash, item.meleeAbilityEntry);
+    mix_byte(hash, item.classAbilityEntry);
+}
+
 } // namespace
 
 /** Builds a nonsecret cache identity from ordered authored equipment. */
@@ -57,16 +91,20 @@ std::uint64_t configured_hash(const AccountState& accountState) noexcept {
     mix_byte(hash, static_cast<std::uint8_t>(accountState.characterCount));
     for (std::size_t characterIndex = 0; characterIndex < accountState.characterCount;
          ++characterIndex) {
-        for (const std::optional<account::inventory::Item>& item :
-             accountState.characters[characterIndex].equipment.slots) {
+        const CharacterState& character = accountState.characters[characterIndex];
+        for (const std::optional<account::inventory::Item>& item : character.equipment.slots) {
             if (!item.has_value()) {
                 mix_byte(hash, kAbsentItemMarker);
                 continue;
             }
             mix_byte(hash, kPresentItemMarker);
-            // SOIDs, quantity, plugs, selection, gates and secrets stay outside build identity.
-            mix_value(hash, item->definitionHash);
-            mix_value(hash, static_cast<std::uint32_t>(item->level));
+            mix_item(hash, *item);
+        }
+        static_assert(account::inventory::kCharacterItemCapacity
+                      <= (std::numeric_limits<std::uint8_t>::max)());
+        mix_byte(hash, static_cast<std::uint8_t>(character.inventory.count));
+        for (std::size_t itemIndex = 0; itemIndex < character.inventory.count; ++itemIndex) {
+            mix_item(hash, character.inventory.values[itemIndex]);
         }
     }
     return hash;

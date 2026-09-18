@@ -34,31 +34,9 @@ struct DefaultDestination final {
     FallbackPolicy fallback{};
 };
 
-/**
- * Destinations that may carry an authored arrival override.
- * A few maps bind their arrival when the map loads instead of declaring it in the packages, so no
- * walk can derive those. The reference set is 20 rows. This leaves room above it.
- */
-inline constexpr std::size_t kArrivalOverrideCapacity = 64;
-
-/**
- * One authored arrival for a named destination, applied over every derived source.
- * Neither field is needed. A row may move only the bubble, only the spawn set, or both.
- */
-struct ArrivalOverride final {
-    std::array<char, destination::kPackageNameCapacity> name{};
-    std::uint8_t nameLength{};
-    std::uint8_t bubble{};
-    bool hasBubble{};
-    std::uint32_t spawnSetHash{};
-    bool hasSpawnSetHash{};
-};
-
 /** Immutable activity defaults supplied while the root State is initialized. */
 struct ActivityDefaults final {
     DefaultDestination defaultDestination{};
-    std::array<ArrivalOverride, kArrivalOverrideCapacity> arrivalOverrides{};
-    std::uint8_t arrivalOverrideCount{};
     /**
      * Sends the membership identity's `field3` as message 5's player key, not the character SOID.
      * That field is the member record's `+16`, which is the value this key must equal.
@@ -66,8 +44,7 @@ struct ActivityDefaults final {
     bool rosterKeyFromIdentity{};
     /**
      * Fills message 5's participation body on every type-13 slot of the key group.
-     * The old encoder fills only the group's first, and the gate reads whichever object the player
-     * datum names, which need not be that one.
+     * The gate reads whichever object the player datum names, which need not be the first slot.
      */
     bool rosterKeyOnAllSlots{};
 };

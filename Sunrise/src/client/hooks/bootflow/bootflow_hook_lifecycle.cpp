@@ -3,6 +3,7 @@
 #include <atomic>
 
 #include "internal.h"
+#include "spawn/slice_set_sample.h"
 
 namespace sunrise::client::hooks::bootflow {
 namespace {
@@ -12,46 +13,27 @@ std::atomic_bool g_installed{false};
 } // namespace
 
 /**
- * Attaches the boot-step fixes that carry sign-in through to orbit.
- * Each fix stands alone at one site, so a miss on one is reported and the others still attach.
- * @return True when every fix attached.
+ * Finds the boot-step accessor and the slice-set sample targets.
+ * Nothing is detoured: the boot steps run as shipped and the host answers them.
+ * @return True when both targets were found.
  */
 bool install() noexcept {
-    const bool hold = install_character_select_hold();
-    const bool sliceSet = install_orbit_slice_set();
-    const bool skip = install_profile_setup_skip();
-    const bool composition = install_composition_check();
-    const bool handoff = install_orbit_handoff();
-    const bool joinReady = install_join_request_ready();
-    const bool ownerSlot = install_owner_activity_slot();
-    const bool regionPrivate = install_region_private();
     const bool worldStep = install_world_step();
-    const bool spawn = install_spawn_hold();
-    const bool fade = install_fade_release();
-    const bool anyFix = hold || sliceSet || skip || composition || handoff || joinReady || ownerSlot
-                        || regionPrivate || worldStep || spawn || fade;
-    g_installed.store(anyFix, std::memory_order_release);
-    return hold && sliceSet && skip && composition && handoff && joinReady && ownerSlot
-           && regionPrivate && worldStep && spawn && fade;
+    const bool sliceSet = spawn::install_targets();
+    const bool probe = install_lifetime_gate_probe();
+    g_installed.store(worldStep || sliceSet || probe, std::memory_order_release);
+    return worldStep && sliceSet && probe;
 }
 
-/** Detaches every boot-step fix, in the reverse order of install. */
+/** Clears both accessors, in the reverse order of install. */
 void uninstall() noexcept {
-    uninstall_fade_release();
-    uninstall_spawn_hold();
+    uninstall_lifetime_gate_probe();
+    spawn::uninstall_targets();
     uninstall_world_step();
-    uninstall_region_private();
-    uninstall_owner_activity_slot();
-    uninstall_join_request_ready();
-    uninstall_orbit_handoff();
-    uninstall_composition_check();
-    uninstall_profile_setup_skip();
-    uninstall_orbit_slice_set();
-    uninstall_character_select_hold();
     g_installed.store(false, std::memory_order_release);
 }
 
-/** @return True while at least one boot-step fix is attached. */
+/** @return True while at least one accessor is found. */
 bool is_installed() noexcept {
     return g_installed.load(std::memory_order_acquire);
 }

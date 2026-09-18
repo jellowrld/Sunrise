@@ -1,28 +1,32 @@
 #include "ability_bucket_catalog.h"
 
+#include <mutex>
+#include <shared_mutex>
+
 #include "../table.h"
+#include "core/threading/srw_lock.h"
 
 namespace sunrise::state::build_data::abilities {
 namespace {
 
-Lock g_lock;
+core::threading::SrwLock g_lock;
 Table<Definition, kDefinitionCapacity> g_definitions;
 
 /** @return True when both rows name the same subclass selection. */
 [[nodiscard]] bool same_key(const Definition& left, const Definition& right) noexcept {
     return left.socketEntryListIndex == right.socketEntryListIndex
-           && left.movementEntry == right.movementEntry;
+           && left.selection == right.selection;
 }
 
 } // namespace
 
 /** Clears every generated ability bucket row under the catalog lock. */
 void clear() noexcept {
-    const Lock::Exclusive guard(g_lock);
+    const std::lock_guard guard(g_lock);
     g_definitions.clear();
 }
 
-/** Checks that no two rows share a subclass and movement selection. */
+/** Checks that no two rows share a subclass and ability selection. */
 bool valid(std::span<const Definition> definitions) noexcept {
     if (definitions.size() > kDefinitionCapacity) {
         return false;
@@ -42,17 +46,17 @@ bool replace(std::span<const Definition> definitions) noexcept {
     if (!valid(definitions)) {
         return false;
     }
-    const Lock::Exclusive guard(g_lock);
+    const std::lock_guard guard(g_lock);
     return g_definitions.replace(definitions);
 }
 
-/** Finds the buckets one subclass publishes under one movement selection. */
+/** Finds the buckets one subclass publishes under one ability selection. */
 bool find(std::uint16_t socketEntryListIndex,
-          std::uint8_t movementEntry,
+          const Selection& selection,
           Definition& definition) noexcept {
     definition = {};
-    const Definition wanted{socketEntryListIndex, movementEntry};
-    const Lock::Shared guard(g_lock);
+    const Definition wanted{socketEntryListIndex, selection};
+    const std::shared_lock guard(g_lock);
     for (const Definition& row : g_definitions.rows()) {
         if (same_key(row, wanted)) {
             definition = row;
@@ -64,13 +68,13 @@ bool find(std::uint16_t socketEntryListIndex,
 
 /** Copies every row in publication order. */
 bool snapshot(std::span<Definition> output, std::size_t& count) noexcept {
-    const Lock::Shared guard(g_lock);
+    const std::shared_lock guard(g_lock);
     return g_definitions.snapshot(output, count);
 }
 
 /** @return Number of generated ability bucket rows, read under the lock. */
 std::size_t count() noexcept {
-    const Lock::Shared guard(g_lock);
+    const std::shared_lock guard(g_lock);
     return g_definitions.count();
 }
 

@@ -1,6 +1,7 @@
 #include <Windows.h>
 
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <span>
 #include <string_view>
@@ -8,21 +9,30 @@
 #include "../../core/logging/log.h"
 #include "../../core/ui/busy/busy.h"
 #include "../../core/ui/notice/ui_notice_overlay.h"
+#include "../../server/bap/runtime.h"
+#include "../activity/mission_launch.h"
+#include "../content/activity/scriptable_catalog_worker.h"
 #include "../content/bootstrap/bootstrap_token_publish.h"
 #include "../content/investment/worker.h"
 #include "../executable/image.h"
 #include "../hooks/assert_handler/assert_handler_lifecycle.h"
-#include "../hooks/banner/banner_hook_lifecycle.h"
-#include "../hooks/bitmap/bitmap_hook_lifecycle.h"
+#include "../hooks/async_io/async_io_lifetime_guard.h"
 #include "../hooks/bootflow/bootflow_hook_lifecycle.h"
+#include "../hooks/cine_probe/cine_probe.h"
 #include "../hooks/config_getter/config_getter_lifecycle.h"
 #include "../hooks/cursor/runtime.h"
 #include "../hooks/graphics/graphics_hook_lifecycle.h"
+#include "../hooks/hitch_probe/hitch_probe.h"
+#include "../hooks/inactivity/inactivity_override.h"
+#include "../hooks/infinite_ammo/infinite_ammo.h"
 #include "../hooks/network/runtime.h"
+#include "../hooks/noclip/runtime.h"
+#include "../hooks/package_trust/package_trust_bypass.h"
 #include "../hooks/polled_input/runtime.h"
-#include "../hooks/queuez/queuez_hook_lifecycle.h"
 #include "../hooks/retail_log/retail_log_lifecycle.h"
+#include "../hooks/stall_probe/stall_probe.h"
 #include "../hooks/teleport/runtime.h"
+#include "../hooks/world_objects/world_object_registry.h"
 #include "../patterns/registry.h"
 #include "../targets/game.h"
 #include "internal.h"
@@ -125,9 +135,16 @@ void clear_game_targets() noexcept {
         report_resolve_failure();
         return false;
     }
+    // Steam initialization installs package trust before base-package registration. Keep this
+    // idempotent check beside the other main-image hooks so activation also verifies ownership.
+    if (!hooks::package_trust::install()) {
+        clear_game_targets();
+        return false;
+    }
     // The SignOn config blob carries this token. It must reach State before any hook owns the
     // resolved targets: extraction cannot recover from a missing bootstrap token.
     if (!content::bootstrap::publish_token()) {
+        (void)hooks::package_trust::uninstall();
         clear_game_targets();
         return false;
     }
@@ -136,6 +153,7 @@ void clear_game_targets() noexcept {
                          core::log::Level::error,
                          "ev=activate stage=game_network result=fail");
         if (!hooks::network::has_game_ownership()) {
+            (void)hooks::package_trust::uninstall();
             clear_game_targets();
         }
         return false;
@@ -152,20 +170,43 @@ void clear_game_targets() noexcept {
     // Diagnostic capture reports its own outcome and never demotes this stage.
     (void)hooks::retail_log::install();
     (void)hooks::assert_handler::install();
+    // Read-only. At a hitch it dumps every in-flight job record from the watchdog snapshot,
+    // which names the job and thread the in-world freeze blocks on.
+    (void)hooks::hitch_probe::install();
+    // Read-only. Some freezes silence the watchdog too; this watcher dumps every thread's rip
+    // and stack from its own thread when the game stops calling the pump.
+    (void)hooks::stall_probe::install();
+    // The stock async-I/O wrapper reloads its singleton after pumping it and can observe the
+    // legitimate teardown/recreate null window. This optional guard keeps the owner it pumped.
+    (void)hooks::async_io::install();
     (void)hooks::config_getter::install();
     // Boot-step fixes scan for their own single-site targets; each reports its own outcome.
     (void)hooks::bootflow::install();
+    // The launcher calls the Director's own selection entry points; nothing is detoured.
+    (void)activity::mission_launch::install();
     // The teleport hooks attach whether or not the feature is on, so the interface can enable it
     // without a restart. Both replacements return immediately while nothing is requested.
     (void)hooks::teleport::install();
-    (void)hooks::queuez::install();
-    // The bitmap reference guard puts the none sentinel in place of a reference outside tag
-    // space. Without it the widget's stored-reference reader faults.
-    (void)hooks::bitmap::install();
-    // The orbit banner component ships unbound, so its update body never runs and it draws the
-    // constructor's values.
-    (void)hooks::banner::install();
+    // Noclip owns its Havok-step target, so a patch-specific miss cannot disable teleport.
+    (void)hooks::noclip::install();
+    // Attaches whether or not the feature is on, so the interface can enable it without a restart.
+    (void)hooks::infinite_ammo::install();
+    // Resolves the activity config getter here; the hold itself runs on the frame tick.
+    (void)hooks::inactivity::install();
+    // Read-only. While the prologue-filler boot task runs, it logs once per second which
+    // cinematic readiness stage is false, the thing the task's five-second timeout hides.
+    (void)hooks::cine_probe::install();
+    // Retains the native handle for package placements without publishing unnamed map objects.
+    (void)hooks::world_objects::install();
+    // The server asks for refresh slices through this and never calls the Client otherwise.
+    if (!server::bap::register_client_investment_slice_consumer(
+            &content::investment::worker::request_slice)) {
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::error,
+                         "ev=activation stage=investment_consumers result=fail");
+    }
     content::investment::worker::activate();
+    content::activity::scriptables::activate();
     return true;
 }
 
@@ -183,10 +224,21 @@ bool activate_main_once() noexcept {
         ReleaseSRWLockExclusive(&runtime::g_lock);
         return active;
     }
+    // The image sweep dominates this call, so the pair of debug markers around it is what a
+    // boot-time measurement reads. Both are diagnostic and stay off at the usual levels.
+    core::log::write(
+        core::log::Channel::client, core::log::Level::debug, "ev=activate stage=main phase=begin");
     // The sweep stalls whichever thread calls it, so the overlay says what is happening. It
     // only reaches the screen once the presentation hooks are installed.
     core::ui::busy::begin(core::ui::busy::Task::initialization);
+    // Started after the overlay is up, because begin blocks for up to half a second waiting on
+    // presents. That wait belongs to the overlay, not to the work being measured.
+    const std::uint64_t startedTick = GetTickCount64();
     const bool active = runtime::activate_required_main_locked();
+    core::log::write_elapsed(core::log::Channel::client,
+                             "ev=activate stage=main phase=complete",
+                             startedTick,
+                             active ? "ok" : "fail");
     core::ui::busy::end(core::ui::busy::Task::initialization);
     if (!active) {
         // A failed sweep latches too: repeating it stalls the frame loop for nothing.

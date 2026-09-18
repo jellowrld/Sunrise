@@ -39,6 +39,10 @@ struct ActivityManagerSelection final {
     bool hasElementIndex{};
     /** Element index, required bias of 1 removed. */
     std::int16_t elementIndex{};
+    /** True when the second optional 64-bit scalar carried a selection nonce. */
+    bool hasSelectionNonce{};
+    /** Exact selection nonce from the second optional 64-bit scalar. */
+    std::uint64_t selectionNonce{};
     /** Number of filled entries in skulls. */
     std::uint8_t skullCount{};
     /** Gameplay selections. Entries past skullCount stay zero. */
@@ -57,12 +61,8 @@ struct ActivityManagerSelection final {
     std::uint8_t packageNameLength{};
     /** Checked package-name bytes, then zero padding. */
     std::array<std::int8_t, kActivityManagerPackageNameCapacity> packageName{};
-    /**
-     * Bit offset of the first name element inside descriptorBits, valid with hasPackageName. A
-     * host sending the client elsewhere rewrites the name in the replayed bits instead of
-     * re-encoding the descriptor, which would drop the fields with no known name.
-     */
-    std::size_t packageNameBit{};
+    /** First name byte's bit offset from the descriptor's first bit. Valid with hasPackageName. */
+    std::size_t packageNameBitOffset{};
     /** Last root boolean. Its gameplay meaning is not known. */
     bool trailingFlag{};
     /**
